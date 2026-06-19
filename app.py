@@ -3,7 +3,7 @@ import streamlit as st
 import docx
 from docx import Document
 from docx.enum.text import WD_COLOR_INDEX
-from openai import AzureOpenAI
+from openai import OpenAI
 import tiktoken
 import difflib
 import io
@@ -166,7 +166,6 @@ Go through the entire document section by section. For every correction you make
 # HELPER FUNCTIONS
 # ==========================================
 def count_tokens(text: str, model: str = "gpt-4o") -> int:
-    """Accurately calculates the tokens for a given block of text."""
     try:
         encoding = tiktoken.encoding_for_model(model)
     except KeyError:
@@ -174,7 +173,6 @@ def count_tokens(text: str, model: str = "gpt-4o") -> int:
     return len(encoding.encode(text))
 
 def chunk_document(paragraphs: list, max_tokens: int = 3000) -> list:
-    """Groups paragraph text into chunks that sit safely below the API token limits."""
     chunks = []
     current_chunk = []
     current_tokens = 0
@@ -197,163 +195,9 @@ def chunk_document(paragraphs: list, max_tokens: int = 3000) -> list:
     return chunks
 
 def generate_highlighted_docx(original_text: str, corrected_text: str) -> io.BytesIO:
-    """Compares texts and compiles a new .docx with yellow highlights on modifications."""
     doc = Document()
-    
     orig_words = original_text.split()
     corr_words = corrected_text.split()
     
     p = doc.add_paragraph()
-    matcher = difflib.SequenceMatcher(None, orig_words, corr_words)
-    
-    for opcode, i1, i2, j1, j2 in matcher.get_opcodes():
-        if opcode == 'equal':
-            p.add_run(" ".join(corr_words[j1:j2]) + " ")
-        elif opcode in ('replace', 'insert'):
-            run = p.add_run(" ".join(corr_words[j1:j2]) + " ")
-            run.font.highlight_color = WD_COLOR_INDEX.YELLOW
-        elif opcode == 'delete':
-            # Visual marker for deleted text segments
-            run = p.add_run("[...] ")
-            run.font.highlight_color = WD_COLOR_INDEX.YELLOW
-
-    output = io.BytesIO()
-    doc.save(output)
-    output.seek(0)
-    return output
-
-# ==========================================
-# STREAMLIT UI LAYOUT
-# ==========================================
-st.set_page_config(page_title="ESS Document Proofreader", page_icon="⚖️", layout="wide")
-
-st.title("Environmental Standards Scotland (ESS)")
-st.subheader("Enterprise Document Compliance & Style Guide Proofreader")
-st.write("Upload a corporate Microsoft Word document (`.docx`) to automatically evaluate adherence to the official ESS accessibility, tone, and formatting rules.")
-
-# File Uploader Container
-uploaded_file = st.file_uploader("Select compliance document", type=["docx"])
-
-if uploaded_file is not None:
-    st.success("Document uploaded successfully.")
-    
-    if st.button("Execute Compliance Proofreading", type="primary"):
-        # Validate environment variables before compute initialization
-        api_key = os.getenv("AZURE_OPENAI_API_KEY")
-        endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
-        deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
-        
-        if not api_key or not endpoint or not deployment:
-            st.error("Infrastructure Configuration Error: Missing Azure environment mappings on host.")
-            st.stop()
-            
-        with st.spinner("Parsing document structure and processing chunks..."):
-            try:
-                # Read paragraphs excluding document comments
-                doc = Document(uploaded_file)
-                raw_paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
-                
-                if not raw_paragraphs:
-                    st.warning("The uploaded document contains no readable paragraph blocks.")
-                    st.stop()
-                
-                chunks = chunk_document(raw_paragraphs, max_tokens=3500)
-                
-                # Initialize Enterprise Azure client
-                client = AzureOpenAI(
-                    api_key=api_key,
-                    api_version="2024-06-01",
-                    azure_endpoint=endpoint
-                )
-                
-                compiled_reports = []
-                compiled_corrections = []
-                
-                # Progress visualization
-                progress_bar = st.progress(0)
-                for index, chunk in enumerate(chunks):
-                    # Request wrapper forcing explicit output schema parsing
-                    user_instruction = (
-                        f"Analyze this document segment:\n\n{chunk}\n\n"
-                        "Provide your output precisely formatted as follows:\n"
-                        "---DIAGNOSTIC_REPORT_START---\n(Your Step 1 Diagnostic Report items)\n---DIAGNOSTIC_REPORT_END---\n"
-                        "---CORRECTED_TEXT_START---\n(The complete corrected text of this segment)\n---CORRECTED_TEXT_END---"
-                    )
-                    
-                    response = client.chat.completions.create(
-                        model=deployment,
-                        messages=[
-                            {"role": "system", "content": SYSTEM_PROMPT},
-                            {"role": "user", "content": user_instruction}
-                        ],
-                        temperature=0.0 # Force objective consistency
-                    )
-                    
-                    response_text = response.choices[0].message.content
-                    
-                    # Extract structured outputs
-                    try:
-                        report_part = response_text.split("---DIAGNOSTIC_REPORT_START---")[1].split("---DIAGNOSTIC_REPORT_END---")[0].strip()
-                        text_part = response_text.split("---CORRECTED_TEXT_START---")[1].split("---CORRECTED_TEXT_END---")[0].strip()
-                    except IndexError:
-                        # Fallback handling in case of slight format anomalies
-                        report_part = response_text
-                        text_part = chunk
-                    
-                    compiled_reports.append(report_part)
-                    compiled_corrections.append(text_part)
-                    
-                    progress_bar.progress((index + 1) / len(chunks))
-                
-                full_original = "\n\n".join(raw_paragraphs)
-                full_report = "\n\n".join(compiled_reports)
-                full_corrected = "\n\n".join(compiled_corrections)
-                
-                # Render results UI
-                st.write("---")
-                st.header("Step 1: Diagnostic Compliance Report")
-                st.markdown(full_report)
-                
-                st.write("---")
-                st.header("Step 2: Corrected Document Generation")
-                
-                # Compile final marked artifact
-                final_docx_bytes = generate_highlighted_docx(full_original, full_corrected)
-                
-                st.download_button(
-                    label="Download Corrected Document (.docx)",
-                    data=final_docx_bytes,
-                    file_name="ESS_Compliance_Corrected.docx",
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                )
-                
-            except Exception as e:
-                st.error(f"An infrastructure or processing fault occurred: {str(e)}")
-
-# ==========================================
-# ENTERPRISE BRANDING FOOTER
-# ==========================================
-st.markdown(
-    """
-    <style>
-    .footer {
-        position: fixed;
-        left: 0;
-        bottom: 0;
-        width: 100%;
-        background-color: #f0f2f6;
-        color: #31333F;
-        text-align: center;
-        padding: 10px;
-        font-size: 14px;
-        font-weight: bold;
-        border-top: 1px solid #e0e0e0;
-        z-index: 999;
-    }
-    </style>
-    <div class="footer">
-        🛡️ Secure Enterprise Pipeline | Powered by Microsoft Azure/Copilot
-    </div>
-    """,
-    unsafe_allow_html=True
-)
+    matcher = difflib.Sequence
