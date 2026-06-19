@@ -4,7 +4,6 @@ import docx
 from docx import Document
 from docx.enum.text import WD_COLOR_INDEX
 from openai import OpenAI
-import tiktoken
 import difflib
 import io
 
@@ -165,30 +164,25 @@ Go through the entire document section by section. For every correction you make
 # ==========================================
 # HELPER FUNCTIONS
 # ==========================================
-def count_tokens(text: str, model: str = "gpt-4o") -> int:
-    try:
-        encoding = tiktoken.encoding_for_model(model)
-    except KeyError:
-        encoding = tiktoken.get_encoding("cl100k_base")
-    return len(encoding.encode(text))
-
-def chunk_document(paragraphs: list, max_tokens: int = 3000) -> list:
+def chunk_document_by_words(paragraphs: list, max_words: int = 2500) -> list:
+    """Groups paragraph blocks cleanly based on an absolute word-count metric."""
     chunks = []
     current_chunk = []
-    current_tokens = 0
+    current_word_count = 0
     
     for p_text in paragraphs:
         if not p_text.strip():
             continue
-        p_tokens = count_tokens(p_text)
-        if current_tokens + p_tokens > max_tokens:
+        p_word_count = len(p_text.split())
+        
+        if current_word_count + p_word_count > max_words:
             if current_chunk:
                 chunks.append("\n\n".join(current_chunk))
             current_chunk = [p_text]
-            current_tokens = p_tokens
+            current_word_count = p_word_count
         else:
             current_chunk.append(p_text)
-            current_tokens += p_tokens
+            current_word_count += p_word_count
             
     if current_chunk:
         chunks.append("\n\n".join(current_chunk))
@@ -200,4 +194,143 @@ def generate_highlighted_docx(original_text: str, corrected_text: str) -> io.Byt
     corr_words = corrected_text.split()
     
     p = doc.add_paragraph()
-    matcher = difflib.Sequence
+    matcher = difflib.SequenceMatcher(None, orig_words, corr_words)
+    
+    for opcode, i1, i2, j1, j2 in matcher.get_opcodes():
+        if opcode == 'equal':
+            p.add_run(" ".join(corr_words[j1:j2]) + " ")
+        elif opcode in ('replace', 'insert'):
+            run = p.add_run(" ".join(corr_words[j1:j2]) + " ")
+            run.font.highlight_color = WD_COLOR_INDEX.YELLOW
+        elif opcode == 'delete':
+            run = p.add_run("[...] ")
+            run.font.highlight_color = WD_COLOR_INDEX.YELLOW
+
+    output = io.BytesIO()
+    doc.save(output)
+    output.seek(0)
+    return output
+
+# ==========================================
+# STREAMLIT UI LAYOUT
+# ==========================================
+st.set_page_config(page_title="ESS Document Proofreader", page_icon="⚖️", layout="wide")
+
+st.title("Environmental Standards Scotland (ESS)")
+st.subheader("Enterprise Document Compliance & Style Guide Proofreader")
+st.write("Upload a corporate Microsoft Word document (`.docx`) to automatically evaluate adherence to the official ESS accessibility, tone, and formatting rules.")
+
+uploaded_file = st.file_uploader("Select compliance document", type=["docx"])
+
+if uploaded_file is not None:
+    st.success("Document uploaded successfully.")
+    
+    if st.button("Execute Compliance Proofreading", type="primary"):
+        github_token = os.getenv("GITHUB_TOKEN")
+        
+        if not github_token:
+            st.error("Infrastructure Configuration Error: Missing GITHUB_TOKEN environment variable.")
+            st.stop()
+            
+        with st.spinner("Parsing document structure and processing chunks..."):
+            try:
+                doc = Document(uploaded_file)
+                raw_paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+                
+                if not raw_paragraphs:
+                    st.warning("The uploaded document contains no readable paragraph blocks.")
+                    st.stop()
+                
+                # Using the revised pure word-counting strategy
+                chunks = chunk_document_by_words(raw_paragraphs, max_words=2500)
+                
+                client = OpenAI(
+                    base_url="https://models.inference.ai.azure.com",
+                    api_key=github_token
+                )
+                
+                compiled_reports = []
+                compiled_corrections = []
+                
+                progress_bar = st.progress(0)
+                for index, chunk in enumerate(chunks):
+                    user_instruction = (
+                        f"Analyze this document segment:\n\n{chunk}\n\n"
+                        "Provide your output precisely formatted as follows:\n"
+                        "---DIAGNOSTIC_REPORT_START---\n(Your Step 1 Diagnostic Report items)\n---DIAGNOSTIC_REPORT_END---\n"
+                        "---CORRECTED_TEXT_START---\n(The complete corrected text of this segment)\n---CORRECTED_TEXT_END---"
+                    )
+                    
+                    response = client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[
+                            {"role": "system", "content": SYSTEM_PROMPT},
+                            {"role": "user", "content": user_instruction}
+                        ],
+                        temperature=0.0
+                    )
+                    
+                    response_text = response.choices[0].message.content
+                    
+                    try:
+                        report_part = response_text.split("---DIAGNOSTIC_REPORT_START---")[1].split("---DIAGNOSTIC_REPORT_END---")[0].strip()
+                        text_part = response_text.split("---CORRECTED_TEXT_START---")[1].split("---CORRECTED_TEXT_END---")[0].strip()
+                    except IndexError:
+                        report_part = response_text
+                        text_part = chunk
+                    
+                    compiled_reports.append(report_part)
+                    compiled_corrections.append(text_part)
+                    
+                    progress_bar.progress((index + 1) / len(chunks))
+                
+                full_original = "\n\n".join(raw_paragraphs)
+                full_report = "\n\n".join(compiled_reports)
+                full_corrected = "\n\n".join(compiled_corrections)
+                
+                st.write("---")
+                st.header("Step 1: Diagnostic Compliance Report")
+                st.markdown(full_report)
+                
+                st.write("---")
+                st.header("Step 2: Corrected Document Generation")
+                
+                final_docx_bytes = generate_highlighted_docx(full_original, full_corrected)
+                
+                st.download_button(
+                    label="Download Corrected Document (.docx)",
+                    data=final_docx_bytes,
+                    file_name="ESS_Compliance_Corrected.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                )
+                
+            except Exception as e:
+                st.error(f"An infrastructure or processing fault occurred: {str(e)}")
+
+# ==========================================
+# ENTERPRISE BRANDING FOOTER
+# ==========================================
+st.markdown(
+    """
+    <style>
+    .footer {
+        position: fixed;
+        left: 0;
+        bottom: 0;
+        width: 100%;
+        background-color: #f0f2f6;
+        color: #31333F;
+        text-align: center;
+        padding: 10px;
+        font-size: 14px;
+        font-weight: bold;
+        border-top: 1px solid #e0e0e0;
+        z-index: 999;
+    }
+    </style>
+    <div class="footer">
+        🛡️ Secure Enterprise Pipeline | Powered by Microsoft Azure/Copilot
+    </div>
+    """,
+    unsafe_allow_html=True
+)
